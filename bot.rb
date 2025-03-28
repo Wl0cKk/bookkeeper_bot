@@ -26,8 +26,7 @@ DB_MUTEX.synchronize {
                 record_row   INTEGER 
             );
         SQL
-    rescue SQLite3::Exception => e
-        puts ''
+    rescue SQLite3::Exception
     end
     puts "#{Time.now} | Running!"
 }
@@ -53,39 +52,87 @@ CATEGORIES = {
     'Photo'                   => ['Photo'                   ,'Фото'                   ],
     'Description'             => ['Description'             ,'Описание'               ]
 }
+.freeze
+
+class DBHelper
+    def self.user_data(db, chat_id, *fields)
+        db.execute("SELECT #{fields.join(',')} FROM users WHERE chat_id = ?", [chat_id]).first
+    end
+
+    def self.update_user(db, chat_id, **updates)
+        set_clause = updates.map { |k, _| "#{k} = ?" }.join(', ')
+        values = updates.values + [chat_id]
+        db.execute("UPDATE users SET #{set_clause} WHERE chat_id = ?", values)
+    end
+
+    def self.create_user(db, chat_id, user_data)
+        db.execute(
+            "INSERT OR IGNORE INTO users (chat_id, username, first_name, last_name) VALUES (?, ?, ?, ?)",
+            [chat_id, user_data[:username], user_data[:first_name], user_data[:last_name]]
+        )
+    end
+end
+
+class TextHelper
+    MESSAGES = {
+        category_selection: ['Choose a category of costs', 'Выбери категорию расходов'],
+        amount_request: ['Send the bill picture with caption of amount spent', 'Отправь фото счета и затраченную сумму одним сообщением'],
+        back_button: ['⬅️ Back', '⬅️ Отмена'],
+        choose_language: ['Please choose your language / Пожалуйста, выберите язык:'],
+        language_changed: ['Language successfully changed', 'Язык успешно сменен'],
+        main_button: ['👉 Bill', '👉 Чек'],
+        reset_confirmation: ['All data has been reset', 'Все данные сброшены'],
+        status_total: ['Total', 'Всего'],
+        payment_error: ['You must send a photo and the amount in one message', 'Вы должны отправить фотографию и сумму одним сообщением'],
+        payment_success: ['Accepted! ✅', 'Принято! ✅'],
+        start_button: ['EN', 'RU']
+    }.freeze
+
+    def self.get(message_key, lang_index)
+        MESSAGES[message_key][lang_index] rescue MESSAGES[message_key].first
+    end
+
+    def self.category_name(category_key, lang_index)
+        CATEGORIES[category_key][lang_index]
+    end
+end
 
 def send_category_selection(bot, db, chat_id)
-    db.execute("UPDATE users SET chat_status = 'def' WHERE chat_id = ?", [chat_id])
-    res = db.execute("SELECT msg_id, language_ind FROM users WHERE chat_id = ?", [chat_id]).first
-    begin
-      bot.api.delete_message(chat_id: chat_id, message_id: res['msg_id'])
-    rescue Telegram::Bot::Exceptions::ResponseError => e
-    end
-  
-    text = res['language_ind'] == 0 ? "Choose a category of costs" : "Выбери категорию расходов"
+    user = DBHelper.user_data(db, chat_id, :msg_id, :language_ind)
+    DBHelper.update_user(db, chat_id, chat_status: 'def')
     
-    categories_buttons = CATEGORIES.reject { |k, _| ['Date', 'Photo', 'Description'].include?(k) }.map do |key, names|
-      Telegram::Bot::Types::InlineKeyboardButton.new(
-        text: names[res['language_ind']],
-        callback_data: "category_#{key}"
-      )
-    end
-  
-    keyboard = categories_buttons.each_slice(2).to_a
-    markup = Telegram::Bot::Types::InlineKeyboardMarkup.new(inline_keyboard: keyboard)
+    delete_message(bot, chat_id, user['msg_id'])
     
-    msg = bot.api.send_message(
-      chat_id: chat_id,
-      text: text,
-      reply_markup: markup
-    )
+    text = TextHelper.get(:category_selection, user['language_ind'])
+    buttons = category_buttons(user['language_ind'])
     
-    db.execute("UPDATE users SET msg_id = ? WHERE chat_id = ?", [msg.message_id, chat_id])
+    send_message_with_markup(bot, db, chat_id, text, buttons)
+end
+
+def category_buttons(lang_index)
+    categories = CATEGORIES.reject { |k, _| %w[Date Photo Description].include?(k) }
+    categories.map { |key, names|
+        Telegram::Bot::Types::InlineKeyboardButton.new(
+            text: names[lang_index],
+            callback_data: "category_#{key}"
+        )
+    }.each_slice(2).to_a
+end
+
+def delete_message(bot, chat_id, message_id)
+    bot.api.delete_message(chat_id: chat_id, message_id: message_id)
+rescue Telegram::Bot::Exceptions::ResponseError
+end
+
+def send_message_with_markup(bot, db, chat_id, text, buttons)
+    markup = Telegram::Bot::Types::InlineKeyboardMarkup.new(inline_keyboard: buttons)
+    msg = bot.api.send_message(chat_id: chat_id, text: text, reply_markup: markup)
+    DBHelper.update_user(db, chat_id, msg_id: msg.message_id)
+    msg
 end
 
 def create_csv(chat_id)
-    CSV.open("#{chat_id}.csv", "wb") do |csv|
-    end
+    CSV.open("#{chat_id}.csv", "wb") { |csv| }
 end
 
 def reset(chat_id)
@@ -93,175 +140,243 @@ def reset(chat_id)
 end
 
 def status(bot, db, chat_id)
-    user = db.execute("SELECT language_ind FROM users WHERE chat_id = ?", [chat_id]).first
+    user = DBHelper.user_data(db, chat_id, :language_ind)
     return unless user
-    language_ind = user['language_ind']
-    reversed_categories = CATEGORIES.each_with_object({}) { |(k, v), h| h[v[0]] = k }
-    sums = Hash.new(0.0)
-    total_sum = 0.0
-    if File.exist?("#{chat_id}.csv")
-        CSV.foreach("#{chat_id}.csv") do |row|
-            next if row.size < 3
-            category_eng = row[1]
-            amount = row[2].to_f rescue 0.0
-            key = reversed_categories[category_eng]
-            if key
-                sums[key] += amount
-                total_sum += amount
-            end
-        end
-    end
-    output = []
-    CATEGORIES.each do |key, names|
-        next if ['Date', 'Photo', 'Description'].include?(key)
-        category_name = names[language_ind]
-        total = sums.fetch(key, 0.0).round(2)
-        output << "#{category_name}: #{total}"
-    end
-    total_text = language_ind == 0 ? "-------------------\nTotal" : "-------------------\nВсего"
-    output << "\n#{total_text}: #{total_sum.round(2)}"
-    text = output.join("\n")
-    bot.api.send_message(chat_id: chat_id, text: text)
-    rescue => e
+
+    sums = calculate_category_sums(chat_id)
+    output = build_status_output(sums, user['language_ind'])
+    bot.api.send_message(chat_id: chat_id, text: output)
+rescue => e
     puts "Error in status: #{e.message}"
 end
 
-begin
-Telegram::Bot::Client.run(TOKEN) { |bot|
-    bot.listen { |message|
-        Thread.start(message) { |message| 
-            case message
-            when Telegram::Bot::Types::Message
-                chat_id = message.chat.id
-                if Time.now.to_i - message.date > 5
-                    puts "skip #{message.from.id}\t|#{message}|\n"
-                    next
-                end
-                exist = db.execute("SELECT 1 FROM users WHERE chat_id = ?", [chat_id])[0]
-                unless exist
-                    case message.text
-                    when '/start'
-                        DB_MUTEX.synchronize {
-                            db.execute(
-                                "INSERT OR IGNORE INTO users (chat_id, username, first_name, last_name) VALUES (?, ?, ?, ?)",
-                                [chat_id, message.from.username || nil, message.from.first_name,  message.from.last_name || '']
-                            )
-                        }
-                        msg = bot.api.send_message(
-                            chat_id: message.chat.id,
-                            text: 'Please choose your language / Пожалуйста, выберите язык:',
-                            reply_markup: Telegram::Bot::Types::ReplyKeyboardMarkup.new(keyboard: [[{ text: 'EN' }, { text: 'RU' }]], one_time_keyboard: true, resize_keyboard: true)
-                        )
-                        db.execute("UPDATE users SET msg_id = ? WHERE chat_id = ?", [msg.message_id, chat_id])
-                        create_csv("#{chat_id}")
-                    end
-                else
-                    case db.execute("SELECT chat_status FROM users WHERE chat_id = $1", [chat_id]).first['chat_status']
-                    when 'def'
-                        case message.text
-                        when 'EN', 'RU'
-                            res = db.execute("SELECT language_ind, chat_status, msg_id FROM users WHERE chat_id = ?", [chat_id]).first
-                            if res.any?
-                                curr = res['language_ind']
-                                new_lang = message.text == 'EN' ? 0 : 1
-                                db.execute("UPDATE users SET language_ind = ?, chat_status = ? WHERE chat_id = ?", [new_lang, 'def', chat_id])
-                                if new_lang == 0
-                                    text = "Language successfully changed"
-                                    kb = '👉 Bill'
-                                elsif new_lang == 1
-                                    text = "Язык успешно сменен"
-                                    kb = '👉 Чек'
-                                end
-                                begin
-                                    bot.api.delete_message(chat_id: chat_id, message_id: res['msg_id'])
-                                rescue Telegram::Bot::Exceptions::ResponseError => e
-                                end
-                                msg = bot.api.send_message(chat_id: chat_id, text: text, reply_markup: Telegram::Bot::Types::ReplyKeyboardMarkup.new(keyboard: [[{text: kb}]], one_time_keyboard: true, resize_keyboard: true))
-                                db.execute("UPDATE users SET msg_id = ? WHERE chat_id = ?", [msg.message_id, chat_id])
-                            end
-                        when /\s*(Чек|Bill)\s*/i
-                            send_category_selection(bot, db, chat_id)
-                        when '/status'
-                            status(bot, db, chat_id)
-                        when '/reset'
-                            reset(chat_id)
-                            lang = db.execute("SELECT language_ind FROM users WHERE chat_id = ?", [chat_id]).first['language_ind']
-                            text = lang == 0 ? "All data has been reset" : "Все данные сброшены"
-                            bot.api.send_message(chat_id: chat_id, text: text)
-                        end
-                    when 'payment'
-                        res = db.execute("SELECT msg_id, language_ind, category FROM users WHERE chat_id = $1", [chat_id]).first
-                        amount = if message.caption
-                            message.caption.match(/\d+(\.\d+)?/)&.[](0) || false
-                        else
-                            false
-                        end
-                        if !message.photo || !(amount)
-                            text = if res['language_ind'] == 0
-                              "You must send a photo and the amount in one message"
-                            else
-                              "Вы должны отправить фотографию и сумму одним сообщением"
-                            end
-                            bot.api.send_message(chat_id: chat_id, text: text)
-                          else
-                            begin
-                                bot.api.delete_message(chat_id: chat_id, message_id: res['msg_id'])
-                            rescue Telegram::Bot::Exceptions::ResponseError => e
-                            end
-                            db.execute("UPDATE users SET chat_status = 'def' WHERE chat_id = ?", [chat_id])
-                            
-                            date = Time.now.strftime("%Y-%m-%d")
-                            photo_file_id = message.photo.last.file_id
-                            category = CATEGORIES[res['category']][0]
+def calculate_category_sums(chat_id)
+    sums = Hash.new(0.0)
+    return sums unless File.exist?("#{chat_id}.csv")
 
-                            CSV.open("#{chat_id}.csv", "a+") do |csv|
-                                csv << [date, category, amount, photo_file_id]
-                            end
-                            confirmation_text = res['language_ind'] == 0 ? "Accepted! ✅" : "Принято! ✅"
-                            button_text = res['language_ind'] == 0 ? "👉Bill" : "👉Чек"
-                            msg = bot.api.send_message(
-                                chat_id: chat_id,
-                                text: confirmation_text,
-                                reply_markup: Telegram::Bot::Types::ReplyKeyboardMarkup.new(
-                                    keyboard: [[{text: button_text}]],
-                                    one_time_keyboard: true,
-                                    resize_keyboard: true
-                                )
-                            )
-                        end
-                    end
+    CSV.foreach("#{chat_id}.csv") { |row|
+        next if row.size < 3
+        category_eng = row[1]
+        amount = row[2].to_f rescue 0.0
+        key = CATEGORIES.find { |_, v| v[0] == category_eng }&.first
+        sums[key] += amount if key
+    }
+    sums
+end
+
+def build_status_output(sums, lang_index)
+    output = []
+    CATEGORIES.each { |key, names|
+        next if %w[Date Photo Description].include?(key)
+        output << "#{names[lang_index]}: #{sums.fetch(key, 0.0).round(2)}"
+    }
+    
+    total = sums.values.sum.round(2)
+    total_text = TextHelper.get(:status_total, lang_index)
+    output << "\n-------------------\n#{total_text}: #{total}"
+    output.join("\n")
+end
+
+def handle_message(bot, db, message)
+    chat_id = message.chat.id
+    return if Time.now.to_i - message.date > 5
+
+    case message.text
+    when '/start'
+        handle_start(bot, db, chat_id, message.from)
+    when '/status'
+        status(bot, db, chat_id)
+    when '/reset'
+        handle_reset(bot, db, chat_id)
+    else
+        handle_regular_message(bot, db, chat_id, message)
+    end
+end
+
+def handle_start(bot, db, chat_id, user)
+    DBHelper.create_user(db, chat_id, {
+        username: user.username,
+        first_name: user.first_name,
+        last_name: user.last_name || ''
+    })
+
+    msg = bot.api.send_message(
+        chat_id: chat_id,
+        text: TextHelper.get(:choose_language, 0),
+        reply_markup: Telegram::Bot::Types::ReplyKeyboardMarkup.new(
+            keyboard: [[
+                { text: TextHelper.get(:start_button, 0) }, 
+                { text: TextHelper.get(:start_button, 1) }
+            ]],
+            one_time_keyboard: true,
+            resize_keyboard: true
+        )
+    )
+    DBHelper.update_user(db, chat_id, msg_id: msg.message_id)
+end
+
+def handle_reset(bot, db, chat_id)
+    reset(chat_id)
+    user = DBHelper.user_data(db, chat_id, :language_ind)
+    bot.api.send_message(
+        chat_id: chat_id,
+        text: TextHelper.get(:reset_confirmation, user['language_ind'])
+    )
+end
+
+def handle_regular_message(bot, db, chat_id, message)
+    user = DBHelper.user_data(db, chat_id, :chat_status, :msg_id, :language_ind, :category)
+    return unless user
+
+    case user['chat_status']
+    when 'def'
+        handle_def_status(bot, db, chat_id, message, user)
+    when 'payment'
+        handle_payment(bot, db, chat_id, message, user)
+    end
+end
+
+def handle_def_status(bot, db, chat_id, message, user)
+    case message.text
+    when /(Чек|Bill)/i
+        send_category_selection(bot, db, chat_id)
+    when 'EN', 'RU'
+        handle_language_change(bot, db, chat_id, message.text, user)
+    end
+end
+
+def handle_language_change(bot, db, chat_id, lang, user)
+    new_lang = lang == 'EN' ? 0 : 1
+    DBHelper.update_user(db, chat_id, 
+        language_ind: new_lang,
+        chat_status: 'def'
+    )
+
+    delete_message(bot, chat_id, user['msg_id'])
+    confirmation = TextHelper.get(:language_changed, new_lang)
+    button_text = TextHelper.get(:main_button, new_lang)
+
+    msg = bot.api.send_message(
+        chat_id: chat_id,
+        text: confirmation,
+        reply_markup: Telegram::Bot::Types::ReplyKeyboardMarkup.new(
+            keyboard: [[{ text: button_text }]],
+            one_time_keyboard: true,
+            resize_keyboard: true
+        )
+    )
+    DBHelper.update_user(db, chat_id, msg_id: msg.message_id)
+end
+
+def handle_payment(bot, db, chat_id, message, user)
+    amount = parse_amount(message)
+    if valid_payment?(message, amount)
+        process_payment(bot, db, chat_id, message, user, amount)
+    else
+        send_payment_error(bot, chat_id, user)
+    end
+end
+
+def parse_amount(message)
+    if message.caption
+        message.caption.match(/\d+(\.\d+)?/)&.[](0)
+    else
+        false
+    end
+end
+
+def valid_payment?(message, amount)
+    message.photo && amount
+end
+
+def process_payment(bot, db, chat_id, message, user, amount)
+    delete_message(bot, chat_id, user['msg_id'])
+    DBHelper.update_user(db, chat_id, chat_status: 'def')
+
+    save_to_csv(chat_id, user, amount, message.photo.last.file_id)
+
+    confirmation = TextHelper.get(:payment_success, user['language_ind'])
+    button_text = TextHelper.get(:main_button, user['language_ind'])
+
+    msg = bot.api.send_message(
+        chat_id: chat_id,
+        text: confirmation,
+        reply_markup: Telegram::Bot::Types::ReplyKeyboardMarkup.new(
+            keyboard: [[{ text: button_text }]],
+            one_time_keyboard: true,
+            resize_keyboard: true
+        )
+    )
+    DBHelper.update_user(db, chat_id, msg_id: msg.message_id)
+end
+
+def save_to_csv(chat_id, user, amount, file_id)
+    CSV.open("#{chat_id}.csv", "a+") { |csv|
+        csv << [
+            Time.now.strftime("%Y-%m-%d"),
+            TextHelper.category_name(user['category'], 0),
+            amount,
+            file_id
+        ]
+    }
+end
+
+def send_payment_error(bot, chat_id, user)
+    bot.api.send_message(
+        chat_id: chat_id,
+        text: TextHelper.get(:payment_error, user['language_ind'])
+    )
+end
+
+def handle_callback(bot, db, callback)
+    chat_id = callback.from.id
+    case callback.data
+    when /^category_/
+        handle_category_selection(bot, db, chat_id, callback)
+    when 'back'
+        send_category_selection(bot, db, chat_id)
+    end
+end
+
+def handle_category_selection(bot, db, chat_id, callback)
+    category = callback.data.split('_').last
+    bot.api.answer_callback_query(callback_query_id: callback.id, text: category)
+    
+    DBHelper.update_user(db, chat_id, chat_status: 'payment', category: category)
+    user = DBHelper.user_data(db, chat_id, :msg_id, :language_ind)
+
+    text = TextHelper.get(:amount_request, user['language_ind'])
+    back_button = Telegram::Bot::Types::InlineKeyboardButton.new(
+        text: TextHelper.get(:back_button, user['language_ind']),
+        callback_data: 'back'
+    )
+
+    msg = bot.api.edit_message_text(
+        chat_id: chat_id,
+        message_id: user['msg_id'],
+        text: text,
+        reply_markup: Telegram::Bot::Types::InlineKeyboardMarkup.new(
+            inline_keyboard: [[back_button]]
+        )
+    )
+    DBHelper.update_user(db, chat_id, msg_id: msg.message_id)
+end
+
+begin
+    Telegram::Bot::Client.run(TOKEN) { |bot|
+        bot.listen { |message|
+            Thread.start(message) { |message|
+                case message
+                when Telegram::Bot::Types::Message
+                    handle_message(bot, db, message)
+                when Telegram::Bot::Types::CallbackQuery
+                    handle_callback(bot, db, message)
                 end
-            when Telegram::Bot::Types::CallbackQuery
-                chat_id = message.from.id
-                case message.data
-                when /^category_/
-                    callback_id = message.id
-                    data = message.data.split('_').last
-                    bot.api.answer_callback_query(callback_query_id: callback_id, text: data)
-                    db.execute("UPDATE users SET chat_status = 'payment' WHERE chat_id = ?", [chat_id])
-                    res = db.execute("SELECT * FROM users WHERE chat_id = ?", [chat_id]).first
-                    if res['language_ind'] == 0
-                        text = "Send the bill picture with caption of amount spent"
-                        back = "⬅️ Back"
-                    else
-                        text = "Отправь фото счета и затраченную сумму одним сообщением"
-                        back = "⬅️ Отмена"
-                    end
-                    markup = Telegram::Bot::Types::InlineKeyboardMarkup.new(
-                        inline_keyboard: [[{ text: back, callback_data: 'back' }]]
-                    )
-                    msg = bot.api.edit_message_text(chat_id: chat_id, message_id: res['msg_id'], text: text, reply_markup: markup)
-                    db.execute("UPDATE users SET msg_id = ?, category = ? WHERE chat_id = ?", [msg.message_id, data, chat_id])
-                when 'back'
-                    send_category_selection(bot, db, chat_id)
-                end
-            end
-        } # thread
-    } # listen
-} # Telegram
+            }
+        }
+    }
 rescue Interrupt
     db.close if db
     puts "\rBye\n\n"
     exit
 end
-
